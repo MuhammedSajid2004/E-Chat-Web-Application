@@ -1,0 +1,284 @@
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
+import shutil
+import os
+import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List
+from .. import schemas, database, models, auth, chat_manager, crud
+import json 
+import logging
+from pathlib import Path
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
+
+# File upload configuration  
+UPLOAD_DIR = Path("backend/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_EXTENSIONS = {
+    'image': ['.jpg', '.jpeg', '.png', '.gif', '.webp'],
+    'document': ['.pdf', '.doc', '.docx', '.txt', '.xls', '.xlsx', '.ppt', '.pptx'],
+    'video': ['.mp4', '.mov', '.avi', '.mkv'],
+    'audio': ['.mp3', '.wav', '.ogg', '.m4a']
+}
+
+@router.get("/contacts", response_model=List[schemas.ContactResponse])
+async def get_contacts(
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    return await crud.get_contacts(db, current_user["id"])
+
+@router.post("/contacts", response_model=schemas.ContactResponse)
+async def add_contact(
+    payload: schemas.ContactCreate,
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    contact = await crud.add_contact(db, current_user["id"], payload.email)
+    if not contact:
+        raise HTTPException(400, "User not found or invalid")
+    return contact
+
+@router.post("/groups", response_model=schemas.GroupResponse)
+async def create_group(
+    payload: schemas.GroupCreate,
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    return await crud.create_group(db, payload.name, current_user["id"])
+
+@router.get("/groups", response_model=List[schemas.GroupResponse])
+async def get_groups(
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    return await crud.get_user_groups(db, current_user["id"])
+
+@router.post("/groups/{group_id}/members", response_model=schemas.UserResponse)
+async def add_group_member(
+    group_id: int,
+    payload: schemas.GroupMemberAdd,
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    # TODO: Verify current_user is admin? MVP: Skip check
+    member = await crud.add_group_member(db, group_id, payload.email)
+    if not member:
+        raise HTTPException(400, "User not found or already in group")
+    return member
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(auth.get_current_user)
+):
+    # Validate file size
+    file.file.seek(0, 2)
+    size = file.file.tell()
+    file.file.seek(0)
+    if size > MAX_FILE_SIZE:
+        raise HTTPException(400, f"File too large. Max {MAX_FILE_SIZE // (1024*1024)}MB")
+    
+    # Get file extension
+    ext = Path(file.filename).suffix.lower() if file.filename else '.bin'
+    
+    # Save file
+    filename = f"{uuid.uuid4()}{ext}"
+    file_path = UPLOAD_DIR / filename
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    return {
+        "url": f"/uploads/{filename}",
+        "filename": file.filename,
+        "type": file.content_type,
+        "size": size
+    }
+
+@router.get("/history/{contact_or_group_id}", response_model=List[schemas.MessageResponse])
+async def get_history(
+    contact_or_group_id: int,
+    is_group: bool = False,
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    return await crud.get_chat_history(db, current_user["id"], contact_or_group_id, is_group)
+
+@router.post("/calls", response_model=schemas.CallHistoryResponse)
+async def log_call(
+    payload: schemas.CallHistoryCreate,
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    """Log a completed, missed, or rejected call"""
+    return await crud.create_call_history(
+        db,
+        caller_id=current_user["id"],
+        receiver_id=payload.receiver_id,
+        call_type=payload.call_type,
+        status=payload.status,
+        duration=payload.duration,
+    )
+
+@router.get("/calls", response_model=list[schemas.CallHistoryResponse])
+async def get_calls(
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    """Get this user's call history"""
+    return await crud.get_call_history(db, current_user["id"])
+
+
+@router.post("/message", response_model=schemas.MessageResponse)
+async def send_message_http(
+    payload: schemas.MessageCreate,
+    current_user: dict = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(database.get_db)
+):
+    """
+    HTTP fallback for sending messages when Socket.IO is unavailable.
+    Saves to DB and pushes to both sender and receiver via Socket.IO if possible.
+    """
+    user_id = current_user["id"]
+    message = await crud.create_message(
+        db,
+        sender_id=user_id,
+        receiver_id=payload.receiver_id,
+        group_id=payload.group_id,
+        content=payload.content,
+        file_url=payload.file_url,
+        file_type=payload.file_type,
+        file_name=payload.file_name,
+        file_size=payload.file_size,
+    )
+
+    message_payload = {
+        'id': message.id,
+        'content': message.content,
+        'sender_id': message.sender_id,
+        'receiver_id': message.receiver_id,
+        'group_id': message.group_id,
+        'created_at': message.created_at.isoformat(),
+        'status': message.status,
+        'is_forwarded': False,
+        'edited': False,
+        'file_url': message.file_url,
+        'file_type': message.file_type,
+        'file_name': message.file_name,
+    }
+
+    # Also push via Socket.IO so both parties get live updates
+    try:
+        sio = chat_manager.sio_ref
+        if sio:
+            if payload.receiver_id:
+                await chat_manager.send_to_user(sio, payload.receiver_id, 'new_message', message_payload)
+            elif payload.group_id:
+                member_ids = await crud.get_group_members_ids(db, payload.group_id)
+                for mid in member_ids:
+                    if mid != user_id:
+                        await chat_manager.send_to_user(sio, mid, 'new_message', message_payload)
+            # Confirm to sender
+            await chat_manager.send_to_user(sio, user_id, 'message_sent', message_payload)
+    except Exception as e:
+        logger.warning(f"Socket push after HTTP send failed (non-fatal): {e}")
+
+    return message
+
+@router.websocket("/ws")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str,
+    db: AsyncSession = Depends(database.get_db)
+):
+    user = auth.verify_token(token)
+    if not user:
+        await websocket.close(code=4001)
+        return
+
+    user_id = user["id"]
+    await chat_manager.manager.connect(websocket, user_id)
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            logger.info(f"WS Received: {data}")
+            msg_data = json.loads(data)
+            msg_type = msg_data.get("type", "text")
+            receiver_id = msg_data.get("receiver_id")
+            
+            msg_type = msg_data.get("type", "text") # text, file, typing_...
+            
+            if msg_type in ["text", "file"]:
+                content = msg_data.get("content")
+                # receiver_id OR group_id
+                receiver_id = msg_data.get("receiver_id")
+                group_id = msg_data.get("group_id")
+                
+                # File Metadata
+                file_url = msg_data.get("file_url")
+                file_type = msg_data.get("file_type")
+                file_name = msg_data.get("file_name")
+                file_size = msg_data.get("file_size")
+
+                # Create Message
+                db_msg = await crud.create_message(
+                    db, 
+                    sender_id=user_id, 
+                    receiver_id=receiver_id,
+                    group_id=group_id,
+                    content=content,
+                    file_url=file_url,
+                    file_type=file_type,
+                    file_name=file_name,
+                    file_size=file_size
+                )
+                logger.info(f"Message Created: ID={db_msg.id}")
+                
+                # Payload to send
+                out_msg = {
+                    "type": "new_message",
+                    "id": db_msg.id,
+                    "content": db_msg.content,
+                    "sender_id": user_id,
+                    "receiver_id": receiver_id,
+                    "group_id": group_id,
+                    # File Data
+                    "file_url": db_msg.file_url,
+                    "file_type": db_msg.file_type,
+                    "file_name": db_msg.file_name,
+                    "file_size": db_msg.file_size,
+                    "created_at": str(db_msg.created_at),
+                    "status": "sent"
+                }
+
+                if group_id:
+                    # Broadcast to Group API
+                    # Get members
+                    member_ids = await crud.get_group_members_ids(db, group_id)
+                    for member_id in member_ids:
+                        if member_id != user_id: # Don't echo twice if frontend optimistic
+                             await chat_manager.manager.send_personal_message(out_msg, member_id)
+                    # Echo to sender
+                    await chat_manager.manager.send_personal_message(out_msg, user_id)
+
+                elif receiver_id:
+                    # 1-to-1
+                    await chat_manager.manager.send_personal_message(out_msg, receiver_id)
+                    await chat_manager.manager.send_personal_message(out_msg, user_id)
+
+            elif msg_type == "typing_start" or msg_type == "typing_stop":
+                 # Helper to route typing events
+                 pass # TODO: Implement typing for groups later
+            
+            elif msg_type == "message_read":
+                 pass
+
+    except WebSocketDisconnect:
+        chat_manager.manager.disconnect(websocket, user_id)
+    except Exception as e:
+        logger.error(f"WebSocket Error: {e}", exc_info=True)
+        await websocket.close()
