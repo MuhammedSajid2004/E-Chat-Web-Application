@@ -44,7 +44,7 @@ A modern, secure real-time chat application built with FastAPI, Socket.IO, and N
 
 1. **Clone the repository**
    ```bash
-   cd /Users/marvinmvarghese/E_Chat
+   cd /Users/MuhammedSajid2004/E-Chat-Web-Application
    ```
 
 2. **Create virtual environment**
