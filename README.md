@@ -1,7 +1,7 @@
 # E_Chat - Real-Time Secure Communication
 
 A modern, secure real-time chat application built with FastAPI, Socket.IO, and Next.js.
-hi
+
 ## Features
 
 - 🔐 Secure authentication with JWT
